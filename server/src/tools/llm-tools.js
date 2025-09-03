@@ -13,7 +13,7 @@ import {
 } from '../helpers/validators.js';
 import {
   normalizeDateTimeToUTC,
-  normalizeBirthDate
+  normalizeBirthDate,
 } from '../helpers/ai-normalize.js';
 
 const CLINIC_TZ = process.env.CLINIC_TZ || 'America/Sao_Paulo';
@@ -23,32 +23,47 @@ const CLINIC_TZ = process.env.CLINIC_TZ || 'America/Sao_Paulo';
 /* -------------------------------------------------------------------------- */
 export async function validarDataHora(args) {
   const tz = CLINIC_TZ;
-  const raw = String(args?.dataText || '');
+  const raw = String(args?.dataText ?? '').trim();
 
-  // IA primeiro
-  const isoUTC = await normalizeDateTimeToUTC(raw, tz);
-  console.log('[validarDataHora] via LLM →', isoUTC);
+  const norm = await normalizeDateTimeToUTC(raw, tz); // { isoUTC, hasTime, ymdLocal }
+  if (!norm) {
+    return {
+      ok: false,
+      message: 'Data/hora inválida. Informe com dia/mês/ANO e hora (ex.: 08/10/2025 14:00 ou "8 de outubro de 2025 às 14:00").'
+    };
+  }
 
+  const { isoUTC, hasTime, ymdLocal } = norm;
+
+  // compara por DIA local (sem hora)
+  const todayYMD = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit'
+  }).format(new Date());
+
+  if (hasTime === false) {
+    // Só data: aceitar HOJE ou futuro
+    if (ymdLocal < todayYMD) {
+      return { ok: false, message: 'A data deve ser hoje ou no futuro. Informe um dia válido.' };
+    }
+    return { ok: true, isoUTC: null, ymdLocal, hasTime: false };
+  }
+
+  // Com hora: precisa ser estritamente no futuro
   if (!isoUTC) {
-    console.warn('[validarDataHora] FAIL for:', raw);
-    return {
-      ok: false,
-      message:
-        'Data/hora inválida. Informe com dia/mês/ANO e hora (ex.: 08/10/2025 14:00 ou "8 de outubro de 2025 às 14:00").'
-    };
+    return { ok: false, message: 'Informe também a hora (ex.: 14:00) para eu prosseguir.' };
   }
 
-  // não permitir datas passadas
-  const date = new Date(isoUTC);
-  if (date.getTime() <= Date.now()) {
-    return {
-      ok: false,
-      message: 'A data/hora deve ser no futuro. Informe um horário válido.'
-    };
+  const d = new Date(isoUTC);
+  if (d.getTime() <= Date.now()) {
+    return { ok: false, message: 'A data/hora deve ser no futuro. Informe um horário válido.' };
   }
 
-  return { ok: true, isoUTC };
+  return { ok: true, isoUTC, ymdLocal, hasTime: true };
 }
+
+
+
+
 
 /* -------------------------------------------------------------------------- */
 /* helpers internos                                                            */
@@ -172,11 +187,19 @@ export const criarAgendamentoDB = async (payload) => {
       return { ok: false, message: 'Telefone inválido. Envie com DDI + DDD (ex.: 55 11 91234-5678).' };
     }
 
-    // Data/hora desejada → UTC ISO
-    const isoUTC = await normalizeDateTimeToUTC(data.dataISO, CLINIC_TZ);
-    if (!isoUTC) {
+    // 🔸 Data/hora desejada → usar o novo normalizador (objeto)
+    const norm = await normalizeDateTimeToUTC(data.dataISO, CLINIC_TZ); // { isoUTC, hasTime, ymdLocal }
+    if (!norm) {
       return { ok: false, message: 'Data/hora da consulta inválida. Use 25/08/2025 18:00 ou "25 de agosto de 2025 às 18:00".' };
     }
+
+    const { isoUTC, hasTime } = norm;
+
+    // 🔒 Agendamento exige HORA explícita
+    if (hasTime === false || !isoUTC) {
+      return { ok: false, message: 'Para confirmar o agendamento, preciso da HORA (ex.: 14:00). Pode me informar?' };
+    }
+
 
     // 1) RESERVA do slot (livre -> agendado)
     const res = await _reservarSlot({ slotId: data.slotId, isoUTC, medicoId: data.medicoId });
