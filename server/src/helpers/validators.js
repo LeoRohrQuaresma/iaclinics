@@ -20,28 +20,45 @@ export function isValidEmail(s) {
 }
 
 // Normalização e validação de WhatsApp (E.164 sem '+')
-export function normalizeWhatsNumber(input, defaultCountry = process.env.DEFAULT_COUNTRY_CODE || '55') {
-  let d = String(input || '').replace(/\D/g, '');
-  if (!d) return '';
+export function normalizeWhatsNumber(input, defaultDDI = process.env.DEFAULT_COUNTRY_CODE || '55') {
+  let digits = String(input || '').replace(/\D/g, '');
+  if (!digits) return '';
 
-  if (d.startsWith('00')) d = d.slice(2);
-  if (d.startsWith('+')) d = d.slice(1);
+  // Remove "00" (discagem internacional)
+  if (digits.startsWith('00')) digits = digits.slice(2);
 
-  if (/^[1-9]\d{10,14}$/.test(d)) return d;
-
-  if (defaultCountry === '55' && (d.length === 10 || d.length === 11)) {
-    return '55' + d;
+  // BR: remove "0" tronco antes do DDD (ex.: 0 51 9....)
+  if (defaultDDI === '55' && (digits.length === 11 || digits.length === 12) && digits.startsWith('0')) {
+    digits = digits.slice(1);
   }
-  return d;
+
+  // Se veio só DDD + número (10 ou 11 dígitos), prefixa DDI padrão
+  if (!digits.startsWith(defaultDDI) && (digits.length === 10 || digits.length === 11)) {
+    digits = defaultDDI + digits;
+  }
+
+  // Corrige "0" imediatamente após o DDI (ex.: 55011... -> 5511...)
+  if (digits.startsWith(defaultDDI + '0')) {
+    digits = defaultDDI + digits.slice(defaultDDI.length + 1);
+  }
+
+  return digits;
 }
 
-export function isValidWhatsNumber(n, defaultCountry = process.env.DEFAULT_COUNTRY_CODE || '55') {
-  const s = String(n || '');
-  if (!/^[1-9]\d{10,14}$/.test(s)) return false;
+export function isValidWhatsNumber(n, defaultDDI = process.env.DEFAULT_COUNTRY_CODE || '55') {
+  const s = String(n || '').replace(/\D/g, '');
+  if (!/^\d{11,15}$/.test(s)) return false;
 
-  if (defaultCountry === '55' && s.startsWith('55')) {
-    const nacional = s.slice(2);
-    return nacional.length === 10 || nacional.length === 11;
+  if (s.startsWith(defaultDDI)) {
+    const national = s.slice(defaultDDI.length);
+    if (defaultDDI === '55') {
+      // Brasil: DDD(2) + número (8 ou 9) => 10 ou 11 dígitos
+      return /^\d{10,11}$/.test(national);
+    }
+    // Outros países: aceitamos se já veio E.164 completo
+    return true;
   }
+
+  // E.164 de outro país (com DDI diferente do default) também é aceito
   return true;
 }

@@ -92,20 +92,29 @@ async function _reservarSlot({ slotId, isoUTC, medicoId }) {
       return { ok: true, slot: upd };
     }
 
-    // Sem slotId: tenta localizar um slot livre pelo datetime (+ médico opcional)
+    // Sem slotId: tenta localizar um slot livre pelo datetime + médico
     let q = supabase
       .from('agenda_slots')
       .select('id, medico_id, datetime, status')
       .eq('datetime', isoUTC)
       .eq('status', 'livre')
-      .order('id', { ascending: true })
-      .limit(1);
+      .order('id', { ascending: true });
 
     if (medicoId) q = q.eq('medico_id', String(medicoId));
 
-    const { data: found, error: fErr } = await q;
+    // Se não veio medicoId, buscamos 2 para detectar ambiguidade; com medicoId, 1 já basta
+    const { data: found, error: fErr } = await q.limit(medicoId ? 1 : 2);
+
     if (fErr) return { ok: false, message: 'Erro ao verificar disponibilidade.' };
     if (!found?.length) return { ok: false, message: 'Horário indisponível.' };
+
+    // ⚠️ Se houver mais de um slot no mesmo horário e nenhum médico foi especificado, peça desambiguação
+    if (!medicoId && found.length > 1) {
+      return {
+        ok: false,
+        message: 'Há mais de um médico com esse horário. Informe o médico ou escolha um horário da lista.'
+      };
+    }
 
     const candidate = found[0];
 
@@ -184,7 +193,7 @@ export const criarAgendamentoDB = async (payload) => {
     // Telefone → E.164 sem '+'
     const waPhone = normalizeWhatsNumber(data.telefone);
     if (!isValidWhatsNumber(waPhone)) {
-      return { ok: false, message: 'Telefone inválido. Envie com DDI + DDD (ex.: 55 11 91234-5678).' };
+      return { ok: false, message: 'Telefone inválido. Envie com DDD + número (ex.: 11 91234-5678). O DDI (55) é assumido automaticamente.' };
     }
 
     // 🔸 Data/hora desejada → usar o novo normalizador (objeto)
@@ -310,20 +319,71 @@ export async function listarEspecialidadesDB() {
 /* -------------------------------------------------------------------------- */
 export async function listarMedicosDB(args = {}) {
   try {
-    const limite = Math.min(Number(args.limite || 50), 200);
-    let q = supabase.from('medicos').select('id, nome, especialidade_id').order('nome', { ascending: true });
-    if (args.busca) q = q.ilike('nome', `%${args.busca}%`);
-    const { data, error } = await q.limit(limite);
+    const busca = (args.busca ?? '').trim();
+    const LIMITE_HARD = 200;
+    const pageSize = Math.min(Number(args.limite || 8), LIMITE_HARD);
+
+    if (!busca) {
+      return { ok: true, medicos: [], needBusca: true, message: 'Envie parte do nome do médico (ex.: "Ana", "Mendes").' };
+    }
+
+    const { data, error } = await supabase.rpc('search_medicos_v2', { q: busca, lim: pageSize + 1 });
     if (error) return { ok: false, message: 'Erro ao buscar médicos.' };
 
-    const medicos = (data || []).map(m => ({ id: m.id, nome: m.nome, especialidadeId: m.especialidade_id ?? null }));
-    if (!medicos.length) return { ok: true, medicos: [] };
-    return { ok: true, medicos };
+    const hasMore = (data?.length || 0) > pageSize;
+    const page = (data || []).slice(0, pageSize);
+
+    const candidates = page.map(m => ({
+      id: m.id,
+      nome: m.nome,
+      especialidadeId: m.especialidade_id ?? null,
+      score: Math.max(m.sim ?? 0, m.sim_clean ?? 0)
+    }));
+
+    const top2 = [...candidates].sort((a, b) => b.score - a.score).slice(0, 2);
+    const best = top2[0];
+    const second = top2[1];
+
+    let resolvedMedicoId = null, ambiguous = true, resolvedBy = null, confidence = null;
+
+    // único resultado total
+    if (!hasMore && candidates.length === 1) {
+      resolvedMedicoId = String(candidates[0].id);
+      ambiguous = false;
+      resolvedBy = 'unique';
+      confidence = 1;
+    }
+
+    // fuzzy (ranking já é global; ok auto-resolver mesmo com hasMore)
+    if (!resolvedMedicoId && best) {
+      const TOP_SIM_THRESHOLD = 0.82;
+      const MARGIN = 0.12;
+      const marginOk = !second || (best.score - second.score) >= MARGIN;
+
+      if (best.score >= TOP_SIM_THRESHOLD && marginOk) {
+        resolvedMedicoId = String(best.id);
+        ambiguous = false;
+        resolvedBy = 'db_fuzzy';
+        confidence = Number(best.score.toFixed(3));
+      }
+    }
+
+    return {
+      ok: true,
+      medicos: candidates.map(({ score, ...rest }) => rest),
+      hasMore,
+      ambiguous,
+      ...(resolvedMedicoId ? { resolvedMedicoId } : {}),
+      ...(resolvedBy ? { resolvedBy, confidence } : {})
+    };
   } catch (e) {
     console.error('[listarMedicosDB]', e);
     return { ok: false, message: 'Falha inesperada ao listar médicos.' };
   }
 }
+
+
+
 
 /* -------------------------------------------------------------------------- */
 /* listarMedicosPorEspecialidadeDB                                            */
@@ -355,6 +415,7 @@ export async function listarMedicosPorEspecialidadeDB(args = {}) {
 /* -------------------------------------------------------------------------- */
 /* listarHorariosMedicoDB                                                     */
 /* -------------------------------------------------------------------------- */
+// listarHorariosMedicoDB
 export async function listarHorariosMedicoDB(args = {}) {
   try {
     const tz = CLINIC_TZ;
@@ -371,7 +432,7 @@ export async function listarHorariosMedicoDB(args = {}) {
       startUTC = r.start; endUTC = r.end;
     }
 
-    const { data, error } = await supabase
+    let q = supabase
       .from('agenda_slots')
       .select('id, medico_id, datetime, duration_min, status, medicos ( id, nome )')
       .eq('medico_id', String(args.medicoId))
@@ -381,6 +442,17 @@ export async function listarHorariosMedicoDB(args = {}) {
       .order('datetime', { ascending: true })
       .limit(limite);
 
+    // Se o dia solicitado for HOJE no fuso, filtre >= agora
+    if (args.dia) {
+      const todayLocalYMD = new Intl.DateTimeFormat('en-CA', {
+        timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit'
+      }).format(new Date());
+      if (args.dia === todayLocalYMD) {
+        q = q.gte('datetime', new Date().toISOString()); // agora em UTC
+      }
+    }
+
+    const { data, error } = await q;
     if (error) return { ok: false, message: 'Erro ao buscar horários do médico.' };
 
     const fmtLocal = iso => new Date(iso).toLocaleString('pt-BR', {
@@ -403,6 +475,7 @@ export async function listarHorariosMedicoDB(args = {}) {
     return { ok: false, message: 'Falha inesperada ao listar horários do médico.' };
   }
 }
+
 
 /* -------------------------------------------------------------------------- */
 /* listarAgendaSemanalMedicoDB                                                     */
@@ -429,7 +502,6 @@ export async function listarAgendaSemanalMedicoDB(args = {}) {
     const totalDays = daysUntilSunday + 1;            // incluir HOJE
 
     // 4) fim do domingo (exclusive) para janela da query
-    //    Pegamos o YMD do domingo local e convertemos para [startUTC, endUTC] daquele dia;
     const sundayDate = new Date(todayStartUTC.getTime() + daysUntilSunday * 24 * 60 * 60 * 1000);
     const sundayLocalYMD = ymdFmt.format(sundayDate);
     const { endUTC: endOfSundayUTC } = dayRangeUTCFromYYYYMMDD(tz, sundayLocalYMD);
@@ -475,12 +547,17 @@ export async function listarAgendaSemanalMedicoDB(args = {}) {
       slotsByDay.set(dayYMD, arr);
     }
 
-    // 7) monta a agenda para cada dia de HOJE até DOMINGO (mesmo se vazio)
+    // 7) monta a agenda para cada dia de HOJE até DOMINGO (filtrando passados no primeiro dia)
+    const nowTs = Date.now();
     const agenda = [];
     for (let i = 0; i < totalDays; i++) {
       const d = new Date(todayStartUTC.getTime() + i * 24 * 60 * 60 * 1000);
       const ymd = ymdFmt.format(d);
-      agenda.push({ dia: ymd, slots: slotsByDay.get(ymd) || [] });
+      let daySlots = slotsByDay.get(ymd) || [];
+      if (i === 0) {
+        daySlots = daySlots.filter(s => new Date(s.isoUTC).getTime() >= nowTs);
+      }
+      agenda.push({ dia: ymd, slots: daySlots });
     }
 
     return {
@@ -495,6 +572,8 @@ export async function listarAgendaSemanalMedicoDB(args = {}) {
     return { ok: false, message: 'Falha inesperada ao listar agenda semanal.' };
   }
 }
+
+
 
 
 /* -------------------------------------------------------------------------- */
@@ -533,9 +612,9 @@ export async function listarProximoDiaDisponivelMedicoDB(args = {}) {
     const dia = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' })
       .format(new Date(firstIso));
 
-    // Reaproveita sua função diária para trazer todos os slots do dia encontrado
     const { startUTC: s, endUTC: e } = dayRangeUTCFromYYYYMMDD(tz, dia);
-    const { data, error } = await supabase
+
+    let q = supabase
       .from('agenda_slots')
       .select('id, medico_id, datetime, duration_min, status, medicos ( id, nome )')
       .eq('medico_id', medicoId)
@@ -544,6 +623,14 @@ export async function listarProximoDiaDisponivelMedicoDB(args = {}) {
       .eq('status', 'livre')
       .order('datetime', { ascending: true });
 
+    const todayLocalYMD = new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit'
+    }).format(new Date());
+    if (dia === todayLocalYMD) {
+      q = q.gte('datetime', new Date().toISOString());
+    }
+
+    const { data, error } = await q;
     if (error) return { ok: false, message: 'Erro ao buscar slots do próximo dia disponível.' };
 
     const fmtLocal = iso => new Date(iso).toLocaleString('pt-BR', {
@@ -568,9 +655,11 @@ export async function listarProximoDiaDisponivelMedicoDB(args = {}) {
 }
 
 
+
 /* -------------------------------------------------------------------------- */
 /* listarHorariosPorEspecialidadeDB                                           */
 /* -------------------------------------------------------------------------- */
+// listarHorariosPorEspecialidadeDB
 export async function listarHorariosPorEspecialidadeDB(args = {}) {
   try {
     const tz = CLINIC_TZ;
@@ -599,7 +688,7 @@ export async function listarHorariosPorEspecialidadeDB(args = {}) {
     }
 
     // 3) slots livres
-    const { data, error } = await supabase
+    let q = supabase
       .from('agenda_slots')
       .select('id, medico_id, datetime, duration_min, status, medicos ( id, nome )')
       .in('medico_id', medicoIds)
@@ -609,6 +698,16 @@ export async function listarHorariosPorEspecialidadeDB(args = {}) {
       .order('datetime', { ascending: true })
       .limit(limite);
 
+    if (args.dia) {
+      const todayLocalYMD = new Intl.DateTimeFormat('en-CA', {
+        timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit'
+      }).format(new Date());
+      if (args.dia === todayLocalYMD) {
+        q = q.gte('datetime', new Date().toISOString());
+      }
+    }
+
+    const { data, error } = await q;
     if (error) return { ok: false, message: 'Erro ao buscar horários da especialidade.' };
 
     const fmtLocal = iso => new Date(iso).toLocaleString('pt-BR', {
@@ -631,6 +730,7 @@ export async function listarHorariosPorEspecialidadeDB(args = {}) {
     return { ok: false, message: 'Falha inesperada ao listar horários por especialidade.' };
   }
 }
+
 
 
 
@@ -707,11 +807,16 @@ export async function listarAgendaSemanalEspecialidadeDB(args = {}) {
       slotsByDay.set(ymd, arr);
     }
 
+    const nowTs = Date.now();
     const agenda = [];
     for (let i = 0; i < totalDays; i++) {
       const d = new Date(todayStartUTC.getTime() + i * 86400000);
       const ymd = ymdFmt.format(d);
-      agenda.push({ dia: ymd, slots: slotsByDay.get(ymd) || [] });
+      let daySlots = slotsByDay.get(ymd) || [];
+      if (i === 0) {
+        daySlots = daySlots.filter(s => new Date(s.isoUTC).getTime() >= nowTs);
+      }
+      agenda.push({ dia: ymd, slots: daySlots });
     }
 
     return { ok: true, inicio: todayLocalYMD, dias: totalDays, agenda };
@@ -720,6 +825,7 @@ export async function listarAgendaSemanalEspecialidadeDB(args = {}) {
     return { ok: false, message: 'Falha inesperada ao listar agenda semanal por especialidade.' };
   }
 }
+
 
 /* -------------------------------------------------------------------------- */
 /* listarProximoDiaDisponivelEspecialidadeDB                                  */
@@ -768,7 +874,8 @@ export async function listarProximoDiaDisponivelEspecialidadeDB(args = {}) {
     const dia = ymdFmt.format(new Date(firstIso));
 
     const { startUTC: s, endUTC: e } = dayRangeUTCFromYYYYMMDD(tz, dia);
-    const { data, error } = await supabase
+
+    let q = supabase
       .from('agenda_slots')
       .select('id, medico_id, datetime, duration_min, status, medicos ( id, nome )')
       .in('medico_id', medicoIds)
@@ -777,6 +884,14 @@ export async function listarProximoDiaDisponivelEspecialidadeDB(args = {}) {
       .eq('status', 'livre')
       .order('datetime', { ascending: true });
 
+    const todayLocalYMD = new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit'
+    }).format(new Date());
+    if (dia === todayLocalYMD) {
+      q = q.gte('datetime', new Date().toISOString());
+    }
+
+    const { data, error } = await q;
     if (error) return { ok: false, message: 'Erro ao buscar slots do próximo dia disponível (especialidade).' };
 
     const fmtLocal = iso => new Date(iso).toLocaleString('pt-BR', {

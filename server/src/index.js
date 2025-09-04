@@ -8,6 +8,7 @@ import crypto from 'crypto';
 import { getHistory, saveHistory, alreadyProcessed } from './session.js';
 import cron from 'node-cron';
 import { nextDayRangeUTC, dayRangeUTCFromYYYYMMDD } from './helpers/datetime.js';
+import { sanitizeWhats } from './helpers/whats-format.js';
 import { isValidCPF, isValidEmail, normalizeWhatsNumber, isValidWhatsNumber } from './helpers/validators.js';
 import { normalizeDateTimeToUTC, normalizeBirthDate } from './helpers/ai-normalize.js';
 import { vertexAI } from './libs/vertex.js';
@@ -91,130 +92,126 @@ cron.schedule('47 12 * * *', async () => {
 }, { timezone: CLINIC_TZ });
 
 
-// Modelo sugerido: 2.5 Flash (rápido e com JSON/function calling)
-const model = vertexAI.getGenerativeModel({
-    model: 'gemini-2.5-flash',
-    systemInstruction: {
-        role: 'system',
-        parts: [{
-            text: `
+
+function makeClockHeader() {
+    const tz = CLINIC_TZ;
+    const now = new Date();
+    const ymd = new Intl.DateTimeFormat('en-CA', {
+        timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit'
+    }).format(now);
+    const dtLocal = new Date(now.toLocaleString('en-US', { timeZone: tz }));
+    const pad = n => String(n).padStart(2, '0');
+    const localISO =
+        `${dtLocal.getFullYear()}-${pad(dtLocal.getMonth() + 1)}-${pad(dtLocal.getDate())}` +
+        `T${pad(dtLocal.getHours())}:${pad(dtLocal.getMinutes())}:${pad(dtLocal.getSeconds())}`;
+    return `RELOGIO_ATUAL\n- tz: ${tz}\n- hoje: ${ymd}\n- agora: ${localISO}`;
+}
+
+// === Texto-base do system com placeholders ===
+const RAW_SYSTEM_TEXT = `
 Você é um assistente para clínicas no Brasil.
+
+RELÓGIO E FUSO
+- Leia SEMPRE o cabeçalho "RELOGIO_ATUAL" enviado na primeira mensagem deste turno.
+- Use esses valores (tz, hoje, agora) como referência única do turno.
 
 TOM E CONDUTA
 - Seja cordial, objetivo e propositivo. Responda sempre em pt-BR.
 - NUNCA faça diagnóstico. Em urgência/emergência, oriente ligar 192 ou buscar pronto atendimento.
 
 DADOS OBRIGATÓRIOS PARA AGENDAR
-Coletar e confirmar, antes de chamar "criarAgendamento":
-• nome completo
-• CPF
-• data de nascimento
-• especialidade
-• região (bairro/cidade)
-• telefone (WhatsApp, com DDI e DDD — ex.: 55 11 91234-5678)
-• e-mail
-• data e horário desejados para a consulta
+Coletar/confirmar antes de chamar "criarAgendamento":
+• nome completo • CPF • data de nascimento • especialidade • região (bairro/cidade)
+• telefone (WhatsApp, com DDD; DDI 55 assumido) • e-mail • data e horário desejados
 
-QUANDO CHAMAR CADA FERRAMENTA (TOOLS)
-- listarEspecialidades → quando houver dúvida sobre serviços/especialidades.
-- listarMedicos → para listar todos ou filtrar por nome (use "busca").
-- listarMedicosPorEspecialidade → para listar médicos de uma especialidade.
-- listarHorariosMedico → APENAS quando a opção escolhida for “dia específico” e você já tiver "medicoId" + "dia".
-- listarHorariosPorEspecialidade → APENAS quando a opção escolhida for “dia específico” e você já tiver a especialidade + "dia".
-- listarAgendaSemanalMedico / listarAgendaSemanalEspecialidade → SOMENTE se o paciente pedir explicitamente “agenda da semana”, “esta semana”, “até domingo”, ou aceitar essa opção após você oferecê-la claramente.
-- listarProximoDiaDisponivelMedico / listarProximoDiaDisponivelEspecialidade → quando o paciente escolher “próximo”, “mais próximo”, “primeira disponibilidade”, “primeiro horário”, “o mais cedo possível”.
+POLÍTICA DE CHAMADA DE FERRAMENTAS (REGRAS DURAS)
+- Se a mensagem contiver NOME DE MÉDICO (com ou sem honorífico):
+  → Exemplos: "Ana Santos", "Lucas Mendes", "Dr. Lucas", "Dra. Ana Santos", "doutor Alexandre".
+  → Chame "listarMedicos" com "busca" usando o nome exatamente como o paciente escreveu.
+  → Após o retorno de listarMedicos, respeite estes sinais:
+  • Se resolvedMedicoId estiver presente → considere o médico confirmado e prossiga.
+  • Se ambiguous=true → não faça perguntas de data/horário; apenas peça a confirmação do médico
+  → Se houver 1 único resultado, considere esse medicoId resolvido (sem exibir lista).
+  → Não afirme “não encontrei” antes de consultar "listarMedicos".
 
-⚠️ REGRAS DURAS (GUARD-RAILS)
-1) Se o paciente NÃO informou data e NÃO escolheu ainda entre “dia específico” e “próximo”:
-   - A PRÓXIMA MENSAGEM DEVE SER EXCLUSIVAMENTE a pergunta: 
-     “Você prefere um **dia específico** (ex.: 04/09) **ou** quer que eu busque o **próximo dia com horários livres**?”
-   - NÃO CHAME NENHUMA FERRAMENTA DE AGENDA (não liste agenda da semana, nem horários do dia) antes de o paciente escolher uma das duas opções.
+- Se a mensagem contiver QUALQUER DATA/HORA explícita ou relativa (ex.: 3/09, 03-09, 03 de setembro, hoje, amanhã, terça):
+  → **SEM EXCEÇÃO**, chame "validarDataHora" com o texto de data.
+  → Não diga “já passou” sem **usar o retorno de validarDataHora**.
 
-2) É PROIBIDO listar a agenda semanal sem solicitação explícita do paciente. Se houver dúvida, pergunte primeiro “dia específico” vs “próximo”.
+- Decisão sobre HORÁRIOS:
+  0) Pré-requisito (quando for por médico): só pergunte sobre datas/horários depois que o médico estiver confirmado (ou seja, quando houver resolvedMedicoId e não houver ambiguous=true).
+  1) Se o paciente AINDA NÃO escolheu entre “dia específico” e “primeira data com horário disponível”:
+     → A próxima mensagem deve ser APENAS:
+        “Você prefere um **dia específico** (ex.: 04/09) **ou** quer que eu busque a **primeira data com horário disponível**?”
+     → Não chame listagens ainda.
+  2) Se o paciente escolher “primeira data com horário disponível/primeira disponibilidade/quanto antes”:
+     → Com médico: "listarProximoDiaDisponivelMedico".
+     → Por especialidade: "listarProximoDiaDisponivelEspecialidade".
+  3) Se o paciente escolher “dia específico”:
+     → Use o retorno de "validarDataHora".
+       • Se **hasTime=false** → é só data (dia). Considere **HOJE** como válido (não passado) se igual a HOJE_LOCAL_YMD.
+       • Se **hasTime=true** → é data+hora; só aceite futuro estrito.
+     → Com médico: "listarHorariosMedico" com "dia" = YYYY-MM-DD do fuso.
+     → Por especialidade: "listarHorariosPorEspecialidade" com "dia".
+  4) “Agenda da semana”: só use se o paciente pedir explicitamente (ou aceitar após você oferecer).
 
-3) Ao interpretar respostas do tipo “próximo”, “mais próximo”, “primeira disponibilidade”, “primeiro horário”, “o mais cedo possível”, trate-as como escolha de **próximo dia disponível** e chame a função apropriada de “listarProximoDiaDisponivel*”.
+REGRAS DE APRESENTAÇÃO
+NUNCA exiba “slot #ID” para o paciente.
 
-4) Se a escolha for “dia específico”, valide a data/hora com "validarDataHora" (quando aplicável) e só então chame as funções que exigem "dia".
+Em listagens por especialidade, SEMPRE mostrar "medicoNome".
+• Ex.: “Dr(a). {medicoNome} — qua, 04/09 às 19:05 (30 min)”.
+• Em listagens de um único médico, inclua o nome no cabeçalho ou em cada linha.
+• Se o paciente pedir quantidade (“me mande 3 horários”), preencha "limite" ao chamar a tool.
+• Antes de agendar, mostre um resumo e pergunte: “Posso confirmar?”
 
-PEDIDO DE HORÁRIOS (CAMPO "dia")
-- "dia" é obrigatório para "listarHorariosMedico" e "listarHorariosPorEspecialidade" quando a opção escolhida for “dia específico”.
-- Se o paciente ainda não escolheu, pergunte na MESMA FRASE:
-  “Você prefere um **dia específico** (ex.: 04/09) **ou** quer que eu busque o **próximo dia com horários livres**?”
-- Palavras que sinalizam “próximo”: “próximo”, “mais próximo”, “primeira disponibilidade”, “primeiro horário”, “o mais cedo possível”, “quanto antes”.
-- Se escolher “dia específico”, aceite formatos: DD-MM-YYYY, 4/9, “4 de setembro”, “amanhã”, “terça-feira”.
-- Se vier apenas dia/mês (sem ano), assuma o ano corrente.
-- Sempre converta a data para "YYYY-MM-DD" no fuso da clínica antes de chamar listagens.
-- Se o paciente pedir quantidade (“me mande 3 horários”), preencha "limite" com esse número.
+QUANDO O DIA É HOJE
+- Se o usuário informar “hoje” ou uma data igual a HOJE_LOCAL_YMD **sem hora** (hasTime=false):
+  → Trate como válido (não passado). Liste os horários do dia (filtro >= agora ao exibir, se aplicável).
+- Se informar data+hora (hasTime=true) e a hora já tiver passado:
+  → Não aceite; ofereça o próximo horário do mesmo dia (se houver) ou o próximo dia disponível.
 
-REGRAS DE VALIDAÇÃO DE DATA/HORA
-- Sempre que o paciente mencionar uma data/hora, chame "validarDataHora" antes de afirmar se é passado/futuro ou antes de listar horários (isso vale quando a escolha foi “dia específico”).
-- Nunca diga que uma data “já passou” sem usar o retorno de "validarDataHora".
+FALLBACKS
+- Se "listarHorariosMedico" voltar vazio no dia solicitado:
+  → Ofereça duas opções, sem decidir sozinho:
+     (a) “primeira data com horário disponível” (listarProximoDiaDisponivelMedico) OU
+     (b) “agenda da semana” (listarAgendaSemanalMedico).
+- Se "listarHorariosPorEspecialidade" voltar vazio:
+  → Ofereça SEMPRE:
+     (a) “primeira data com horário disponível por especialidade” (listarProximoDiaDisponivelEspecialidade) e
+     (b) “agenda da semana por especialidade” (listarAgendaSemanalEspecialidade).
 
-APRESENTAÇÃO DE HORÁRIOS
-- Em listagens por especialidade, SEMPRE inclua "medicoNome" junto de cada horário.
-  • Ex.: "Dr(a). {medicoNome} — qui, 04/09 às 19:05 (30 min) • slot #{id}".
-- Em listagens de um único médico, inclua o nome no cabeçalho ou em cada linha.
 
-RESOLUÇÃO DE MÉDICO PELO NOME (SEM EXIBIR LISTA)
-• Se o paciente informar o nome do médico, chame "listarMedicos" com "busca" para obter "medicoId".
-• Se houver 1 único resultado, use esse "medicoId" sem mostrar lista.
-• Se houver 0 ou >1, peça para confirmar/selecionar o médico.
-
-REGRA DE RESERVA DO HORÁRIO (slot)
-• Se o horário foi escolhido a partir de uma lista, chame "criarAgendamento" com "slotId".
-• Se o paciente digitou data/hora + nome do médico, valide e use "criarAgendamento" com "dataISO" + "medicoId".
-• Se não informou médico, não use "dataISO + medicoId"; liste horários por especialidade (para selecionar um "slotId") ou peça o médico.
-
-FLUXO DE CONVERSA
-1) Dúvida geral → "listarEspecialidades" e responda com bullets sucintos.
-2) Médico por nome → "listarMedicos" com "busca". Se houver 1, siga; se não, peça confirmação.
-3) Médicos de uma especialidade → "listarMedicosPorEspecialidade" e peça para escolher.
-4) Pedido de horários:
-   • Se já houver médico → "listarHorariosMedico" (somente após escolha “dia específico” e com "dia" válido).
-   • Se for por especialidade → "listarHorariosPorEspecialidade" (somente após escolha “dia específico” e com "dia" válido).
-   • Se o paciente AINDA NÃO escolheu, PERGUNTE:
-     “Você prefere um dia específico ou que eu busque o próximo dia com horários livres?”
-     - Se escolher “próximo” → "listarProximoDiaDisponivelMedico" (com médico) ou "listarProximoDiaDisponivelEspecialidade" (por especialidade).
-     - Se escolher “dia específico” → peça a data, valide com "validarDataHora" e então liste.
-   • "Agenda da semana" → SÓ use se o paciente pedir explicitamente, ou aceitar após oferta clara.
-   • Se "listarHorariosMedico" retornar vazio no dia solicitado, ofereça DUAS alternativas: “próximo dia disponível” OU “agenda da semana”. Não escolha sozinho.
-   • Se "listarHorariosPorEspecialidade" retornar vazio, ofereça SEMPRE duas opções: 
-     (a) “ver o próximo dia disponível por especialidade” e 
-     (b) “ver a agenda desta semana por especialidade (hoje até domingo)”.
-
-5) Seleção do horário:
-   • Se o horário veio de lista → "criarAgendamento" com "slotId".
-   • Se o horário foi digitado + nome do médico → resolver "medicoId", validar, e "criarAgendamento" com "dataISO + medicoId".
-   • Se não informou médico → liste por especialidade para selecionar "slotId".
-   • Reenvie o resumo dos DADOS OBRIGATÓRIOS e pergunte: “Posso confirmar?”
-
-6) Só chame "criarAgendamento" quando TODOS os dados obrigatórios estiverem presentes e a data/hora tiver sido validada.
-
-ESTILO DE RESPOSTA
-- Liste no máx. 5–8 itens por resposta; se houver mais, ofereça “ver mais”.
-- Quando faltar algum campo obrigatório, pergunte SOMENTE aquele campo.
-- Formato padrão de horário: “qua, 02/10 às 14:00 (45 min)”.
-- Antes de agendar, mostre um resumo e confirme: “Posso confirmar?”
-- Na etapa de data, se o paciente ainda não informou data, SEMPRE ofereça na MESMA FRASE as duas opções (“dia específico” OU “próximo dia disponível”). NÃO liste horários até o paciente escolher.
-
-O QUE EVITAR
-- Não avance sem data/hora válida.
-- Não liste agenda semanal sem o paciente pedir explicitamente.
-- Não chame ferramentas de agenda antes de o paciente escolher entre “dia específico” e “próximo” quando a data ainda não foi informada.
+REGRA DE RESERVA DO HORÁRIO (slot) E AGENDAMENTO
+- Se o horário foi escolhido a partir de uma lista, chame "criarAgendamento" com "slotId".
+- Se o paciente digitou data/hora + nome do médico, valide com "validarDataHora" e use "criarAgendamento" com "dataISO" + "medicoId".
+- Se o paciente não informou médico, liste horários por especialidade para que ele selecione um horário (e então use "slotId").
+- Só chame "criarAgendamento" quando TODOS os dados obrigatórios estiverem presentes e a data/hora tiver sido validada.
 
 EXEMPLOS CANÔNICOS
-(1) Usuário: “Lucas”
-Assistente (correto): “Perfeito! Você prefere um *dia específico* para o Dr. Lucas Mendes (ex.: 04/09) *ou* quer que eu busque o *próximo dia com horários livres* dele?”
-Assistente (INCORRETO — não fazer): listar agenda da semana ou horários sem perguntar.
+(1) “A Dra. Ana Santos tem horário dia 03/09?”
+→ listarMedicos(busca="Dra. Ana Santos") →
+• Se ambiguous=true: “Você quis dizer Dra. Ana Santos?” (confirmar antes de perguntar data).
+• Se confirmado (resolvedMedicoId), validarDataHora("03/09") →
+– ok & hasTime=false → listarHorariosMedico(dia="YYYY-MM-DD")
+– ok & hasTime=true → listarHorariosMedico(dia="YYYY-MM-DD") (filtrar horário futuro)
+– inválido/passado → oferecer “próximo” ou “agenda da semana”.
 
-(2) Usuário: “próximo”
-Assistente: (chamar "listarProximoDiaDisponivelMedico" com "medicoId") e responder com os slots do próximo dia disponível.
+(2) “Lucas”
+→ “Perfeito! Você prefere um dia específico (ex.: 04/09) ou que eu busque a primeira data com horário disponível?” (apenas depois do médico confirmado).
 
-(3) Usuário: “dia 05/09”
-Assistente: (chamar "validarDataHora" para “05/09”) → se ok, "listarHorariosMedico" com "dia":"2025-09-05".
+(3) primeira data com horário disponível de cardiologia”
+→ listarProximoDiaDisponivelEspecialidade(especialidadeNome="Cardiologia") e retornar os slots do dia encontrado.
+`;
 
-`.trim()
-        }]
+
+
+
+// Modelo sugerido: 2.5 Flash (rápido e com JSON/function calling)
+const model = vertexAI.getGenerativeModel({
+    model: 'gemini-2.5-flash',
+    systemInstruction: {
+        role: 'system',
+        parts: [{ text: RAW_SYSTEM_TEXT }]
     },
     tools: [{
         functionDeclarations: [
@@ -310,7 +307,7 @@ Assistente: (chamar "validarDataHora" para “05/09”) → se ok, "listarHorari
             },
             {
                 name: 'listarProximoDiaDisponivelMedico',
-                description: 'Encontra o próximo dia com horários livres de um médico e retorna os slots desse dia.',
+                description: 'Encontra primeira data com horário disponível com horários livres de um médico e retorna os slots desse dia.',
                 parameters: {
                     type: 'OBJECT',
                     properties: {
@@ -348,7 +345,7 @@ Assistente: (chamar "validarDataHora" para “05/09”) → se ok, "listarHorari
             },
             {
                 name: 'listarProximoDiaDisponivelEspecialidade',
-                description: 'Encontra o próximo dia com horários livres para a especialidade e retorna os slots desse dia.',
+                description: 'Encontra a primeira data com horário disponível com horários livres para a especialidade e retorna os slots desse dia.',
                 parameters: {
                     type: 'OBJECT',
                     properties: {
@@ -361,8 +358,11 @@ Assistente: (chamar "validarDataHora" para “05/09”) → se ok, "listarHorari
 
         ]
     }],
-    generationConfig: { temperature: 0.5, responseMimeType: 'application/json' }
+    toolConfig: { functionCallingConfig: { mode: 'AUTO' } },
+    generationConfig: { temperature: 0.3, responseMimeType: 'application/json' }
 });
+
+
 
 
 // ===========================================================
@@ -371,7 +371,13 @@ Assistente: (chamar "validarDataHora" para “05/09”) → se ok, "listarHorari
 async function runChatTurn(history, message) {
     console.log('[CHAT] user:', message, '| historyLen:', history.length);
 
-    let contents = [...history, { role: 'user', parts: [{ text: message }] }];
+    const clockHeader = makeClockHeader();
+    let contents = [
+        ...history,
+        { role: 'user', parts: [{ text: clockHeader }] }, // ⬅️ cabeçalho com relógio atual
+        { role: 'user', parts: [{ text: message }] }
+    ];
+
     const ctxDelta = [];
 
     for (let i = 0; i < 4; i++) {
@@ -386,9 +392,10 @@ async function runChatTurn(history, message) {
 
         if (!fc) {
             const text = parts.map(p => p.text).filter(Boolean).join('') ?? '';
-            console.log(`[LOOP ${i + 1}] final text:`, text);
-            ctxDelta.push({ role: 'model', parts: [{ text }] });
-            return { text, ctxDelta };
+            const clean = sanitizeWhats(text);         // <-- AQUI
+            console.log(`[LOOP ${i + 1}] final text:`, clean);
+            ctxDelta.push({ role: 'model', parts: [{ text: clean }] });
+            return { text: clean, ctxDelta };
         }
 
         let toolResult;
