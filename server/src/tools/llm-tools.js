@@ -137,20 +137,103 @@ async function _reservarSlot({ slotId, isoUTC, medicoId }) {
   }
 }
 
+
+function normalizeEspecialidadeTerm(s) {
+  const strip = (x) => String(x || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  const t = String(s || '').trim().toLowerCase();
+  const tn = strip(t);
+
+  // Aliases (pode expandir à vontade)
+  const alias = {
+    cardiologista: 'cardiologia',
+    dermatologista: 'dermatologia',
+    ginecologista: 'ginecologia',
+    obstetra: 'obstetrícia',
+    ortopedista: 'ortopedia',
+    pediatra: 'pediatria',
+    psiquiatra: 'psiquiatria',
+    neurologista: 'neurologia',
+    urologista: 'urologia',
+    oftalmologista: 'oftalmologia',
+    otorrinolaringologista: 'otorrinolaringologia',
+    reumatologista: 'reumatologia',
+    endocrinologista: 'endocrinologia',
+    infectologista: 'infectologia',
+    pneumologista: 'pneumologia',
+    gastroenterologista: 'gastroenterologia',
+    nefrologista: 'nefrologia',
+    hematologista: 'hematologia',
+    oncologista: 'oncologia',
+    alergista: 'alergologia',         // ajuste se no catálogo for "Alergia e Imunologia"
+    geriatra: 'geriatria',
+    'nutrólogo': 'nutrologia',
+    'clínico': 'clínica médica',
+    'clínico geral': 'clínica médica',
+
+    // abreviações comuns
+    dermato: 'dermatologia',
+    cardio: 'cardiologia',
+    gineco: 'ginecologia',
+    oftalmo: 'oftalmologia',
+    otorrino: 'otorrinolaringologia',
+    reumato: 'reumatologia',
+    orto: 'ortopedia',
+    gastro: 'gastroenterologia',
+    pneumo: 'pneumologia',
+    neuro: 'neurologia',
+    endo: 'endocrinologia',
+    nutrologo: 'nutrologia',          // sem acento
+    clinico: 'clínica médica',        // sem acento
+    'clinico geral': 'clínica médica' // sem acento
+  };
+
+  // Também permita lookup sem acento
+  const aliasNo = Object.fromEntries(Object.entries(alias).map(([k, v]) => [strip(k.toLowerCase()), v]));
+
+  if (alias[t]) return alias[t];
+  if (aliasNo[tn]) return aliasNo[tn];
+
+  // Heurísticas morfológicas
+  if (tn.endsWith('ologista')) return t.replace(/ologista$/i, 'ologia');
+  if (tn.endsWith('logista'))  return t.replace(/logista$/i, 'logia');
+  if (tn.endsWith('iatra'))    return t.replace(/iatra$/i, 'iatria');
+  if (tn.endsWith('ista'))     return t.replace(/ista$/i, 'ia');
+
+  return s;
+}
+
 async function _resolveEspecialidadeIds({ especialidadeId, especialidadeNome }) {
   if (especialidadeId) return [especialidadeId];
   if (!especialidadeNome) return [];
-  const { data, error } = await supabase
+
+  const original = String(especialidadeNome).trim();
+  const normalized = normalizeEspecialidadeTerm(original);
+
+  // 1) tenta com o termo original
+  let { data, error } = await supabase
     .from('especialidades')
-    .select('id')
-    .ilike('nome', `%${especialidadeNome}%`);
+    .select('id, nome')
+    .ilike('nome', `%${original}%`);
 
   if (error) return [];
-  return (data || []).map(r => r.id);
+  let ids = (data || []).map(r => r.id);
+
+  // 2) se não achou, tenta com o termo normalizado (ex.: cardiologista → cardiologia)
+  if (!ids.length && normalized && normalized !== original) {
+    const r2 = await supabase
+      .from('especialidades')
+      .select('id, nome')
+      .ilike('nome', `%${normalized}%`);
+    if (!r2.error) ids = (r2.data || []).map(r => r.id);
+  }
+
+  return ids;
 }
 
+
+
 /* -------------------------------------------------------------------------- */
-/* criarAgendamentoDB (mantém o mesmo nome que você usa no runChatTurn)       */
+/* criarAgendamentoDB                                                         */
 /* -------------------------------------------------------------------------- */
 export const criarAgendamentoDB = async (payload) => {
   const schema = z.object({
@@ -258,6 +341,7 @@ export const criarAgendamentoDB = async (payload) => {
     return {
       ok: true,
       id: created.id,
+      message: `Agendamento confirmado! ID da consulta: ${created.id}. Guarde este ID — ele será necessário se você quiser cancelar.`,
       resumo: {
         ...data,
         cpf: cpfNum,
@@ -269,6 +353,7 @@ export const criarAgendamentoDB = async (payload) => {
         medicoId: reservedSlot.medico_id
       }
     };
+
   } catch (e) {
     // rollback se reservou e estourou exceção
     if (reservedSlot?.id) {
@@ -659,7 +744,6 @@ export async function listarProximoDiaDisponivelMedicoDB(args = {}) {
 /* -------------------------------------------------------------------------- */
 /* listarHorariosPorEspecialidadeDB                                           */
 /* -------------------------------------------------------------------------- */
-// listarHorariosPorEspecialidadeDB
 export async function listarHorariosPorEspecialidadeDB(args = {}) {
   try {
     const tz = CLINIC_TZ;
@@ -912,5 +996,80 @@ export async function listarProximoDiaDisponivelEspecialidadeDB(args = {}) {
   } catch (e) {
     console.error('[listarProximoDiaDisponivelEspecialidadeDB] erro:', e);
     return { ok: false, message: 'Falha inesperada ao buscar próximo dia disponível por especialidade.' };
+  }
+}
+
+
+
+/* -------------------------------------------------------------------------- */
+/* desmarcarAgendamentoDB                                                     */
+/* -------------------------------------------------------------------------- */
+export async function desmarcarAgendamentoDB(args = {}) {
+  try {
+    const CANCEL_STATUS = 'cancelado';
+    const { appointmentId } = args || {};
+    if (!appointmentId) return { ok: false, message: 'appointmentId é obrigatório.' };
+
+    // 1) Buscar o agendamento
+    const { data: appt, error: apptErr } = await supabase
+      .from('appointments')
+      .select('id, datetime, status, slot_id, medico_id')
+      .eq('id', appointmentId)
+      .maybeSingle();
+
+    if (apptErr) return { ok: false, message: 'Erro ao buscar agendamento.' };
+    if (!appt) return { ok: false, message: 'Agendamento não encontrado.' };
+
+    const prevStatus = String(appt.status || '').toLowerCase();
+
+    // 2) Atualizar status do appointment para "cancelado" (idempotente)
+    if (prevStatus !== CANCEL_STATUS) {
+      const { error: updErr } = await supabase
+        .from('appointments')
+        .update({ status: CANCEL_STATUS })
+        .eq('id', appt.id);
+
+      if (updErr) return { ok: false, message: 'Falha ao cancelar o agendamento.' };
+    }
+
+    // 3) Liberar o slot (se existir)
+    let freedSlotId = null;
+    if (appt.slot_id) {
+      // Deixa o slot como "livre" (sem exigir status anterior; torna a operação idempotente)
+      const { error: slotErr } = await supabase
+        .from('agenda_slots')
+        .update({ status: 'livre' })
+        .eq('id', appt.slot_id);
+
+      if (slotErr) {
+        // rollback simples do appointment para o status anterior
+        try {
+          if (prevStatus !== CANCEL_STATUS) {
+            await supabase.from('appointments').update({ status: prevStatus }).eq('id', appt.id);
+          }
+        } catch (rbErr) {
+          console.error('[desmarcarAgendamentoDB] rollback falhou:', rbErr);
+        }
+        return { ok: false, message: 'Falha ao liberar o horário da agenda.' };
+      }
+      freedSlotId = appt.slot_id;
+    }
+
+    // 4) Retorno
+    const tz = CLINIC_TZ;
+    const dataLocal = new Date(appt.datetime).toLocaleString('pt-BR', {
+      timeZone: tz, weekday: 'long', day: '2-digit', month: '2-digit', year: 'numeric',
+      hour: '2-digit', minute: '2-digit'
+    });
+
+    return {
+      ok: true,
+      id: appt.id,
+      slotId: freedSlotId,
+      resumo: { dataLocal, medicoId: appt.medico_id ?? null }
+    };
+  } catch (e) {
+    console.error('[desmarcarAgendamentoDB] erro:', e);
+    return { ok: false, message: 'Erro inesperado ao desmarcar.' };
   }
 }

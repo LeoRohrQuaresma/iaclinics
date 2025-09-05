@@ -24,8 +24,8 @@ import {
     listarProximoDiaDisponivelMedicoDB,
     listarAgendaSemanalMedicoDB,
     listarAgendaSemanalEspecialidadeDB,
-    listarProximoDiaDisponivelEspecialidadeDB
-
+    listarProximoDiaDisponivelEspecialidadeDB,
+    desmarcarAgendamentoDB
 } from './tools/llm-tools.js';
 
 
@@ -114,6 +114,7 @@ Você é um assistente para clínicas no Brasil.
 RELÓGIO E FUSO
 - Leia SEMPRE o cabeçalho "RELOGIO_ATUAL" enviado na primeira mensagem deste turno.
 - Use esses valores (tz, hoje, agora) como referência única do turno.
+-  É META — não agradeça nem mencione
 
 TOM E CONDUTA
 - Seja cordial, objetivo e propositivo. Responda sempre em pt-BR.
@@ -133,6 +134,13 @@ POLÍTICA DE CHAMADA DE FERRAMENTAS (REGRAS DURAS)
   • Se ambiguous=true → não faça perguntas de data/horário; apenas peça a confirmação do médico
   → Se houver 1 único resultado, considere esse medicoId resolvido (sem exibir lista).
   → Não afirme “não encontrei” antes de consultar "listarMedicos".
+
+  - NUNCA afirme “CPF inválido” sem basear-se no retorno da tool "criarAgendamento" (ok=false com mensagem de CPF).
+
+ - DATA DE NASCIMENTO
+  → **NUNCA** invente/complete dia, mês ou ano.
+  → Ao chamar "criarAgendamento", **SEMPRE** envie exatamente o que o paciente escreveu; a normalização/validação é da tool.
+  → Só diga “data de nascimento inválida” quando "criarAgendamento" retornar erro.
 
 - Se a mensagem contiver QUALQUER DATA/HORA explícita ou relativa (ex.: 3/09, 03-09, 03 de setembro, hoje, amanhã, terça):
   → **SEM EXCEÇÃO**, chame "validarDataHora" com o texto de data.
@@ -154,6 +162,7 @@ POLÍTICA DE CHAMADA DE FERRAMENTAS (REGRAS DURAS)
      → Com médico: "listarHorariosMedico" com "dia" = YYYY-MM-DD do fuso.
      → Por especialidade: "listarHorariosPorEspecialidade" com "dia".
   4) “Agenda da semana”: só use se o paciente pedir explicitamente (ou aceitar após você oferecer).
+  
 
 REGRAS DE APRESENTAÇÃO
 NUNCA exiba “slot #ID” para o paciente.
@@ -163,6 +172,7 @@ Em listagens por especialidade, SEMPRE mostrar "medicoNome".
 • Em listagens de um único médico, inclua o nome no cabeçalho ou em cada linha.
 • Se o paciente pedir quantidade (“me mande 3 horários”), preencha "limite" ao chamar a tool.
 • Antes de agendar, mostre um resumo e pergunte: “Posso confirmar?”
+• Após criarAgendamento (ok=true), SEMPRE mostre “ID da consulta: {id}” e peça para o paciente guardar (necessário para cancelamento). NUNCA mostre “slotId”.
 
 QUANDO O DIA É HOJE
 - Se o usuário informar “hoje” ou uma data igual a HOJE_LOCAL_YMD **sem hora** (hasTime=false):
@@ -186,6 +196,12 @@ REGRA DE RESERVA DO HORÁRIO (slot) E AGENDAMENTO
 - Se o paciente digitou data/hora + nome do médico, valide com "validarDataHora" e use "criarAgendamento" com "dataISO" + "medicoId".
 - Se o paciente não informou médico, liste horários por especialidade para que ele selecione um horário (e então use "slotId").
 - Só chame "criarAgendamento" quando TODOS os dados obrigatórios estiverem presentes e a data/hora tiver sido validada.
+
+DESMARCAR / CANCELAR CONSULTA
+- Para cancelar, peça ao paciente o **ID da consulta** e chame "desmarcarAgendamento" com "appointmentId".
+- Se a mensagem do paciente contiver um ID no formato UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx) trate-o como candidato a "appointmentId" e **pergunte**: “Você confirma que deseja desmarcar a consulta de ID {appointmentId}?”; **só então**, se o paciente confirmar (ex.: “sim”, “pode cancelar”, “confirmo”), chame "desmarcarAgendamento" com "appointmentId".
+- Após a resposta da tool, confirme o cancelamento e ofereça reagendar.
+
 
 EXEMPLOS CANÔNICOS
 (1) “A Dra. Ana Santos tem horário dia 03/09?”
@@ -354,12 +370,23 @@ const model = vertexAI.getGenerativeModel({
                         aPartirDe: { type: 'STRING', description: 'YYYY-MM-DD (opcional, padrão = hoje/agora no fuso da clínica)' }
                     }
                 }
+            },
+            {
+                name: 'desmarcarAgendamento',
+                description: 'Cancela um agendamento (appointments) e libera o respectivo slot na agenda.',
+                parameters: {
+                    type: 'OBJECT',
+                    properties: {
+                        appointmentId: { type: 'STRING', description: 'ID do agendamento' }
+                    },
+                    required: ['appointmentId']
+                }
             }
 
         ]
     }],
     toolConfig: { functionCallingConfig: { mode: 'AUTO' } },
-    generationConfig: { temperature: 0.3, responseMimeType: 'application/json' }
+    generationConfig: { temperature: 0.2, responseMimeType: 'application/json' }
 });
 
 
@@ -423,6 +450,8 @@ async function runChatTurn(history, message) {
             toolResult = await listarAgendaSemanalEspecialidadeDB(fc.args || {});
         } else if (fc.name === 'listarProximoDiaDisponivelEspecialidade') {
             toolResult = await listarProximoDiaDisponivelEspecialidadeDB(fc.args || {});
+        } else if (fc.name === 'desmarcarAgendamento') {
+            toolResult = await desmarcarAgendamentoDB(fc.args || {});
         } else {
             toolResult = { ok: false, message: `Função desconhecida: ${fc.name}` };
         }
