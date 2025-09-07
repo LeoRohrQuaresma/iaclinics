@@ -2,15 +2,11 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { VertexAI } from '@google-cloud/vertexai';
-import { z, ZodError } from 'zod';
 import { supabase } from './supabase.js';
-import crypto from 'crypto';
 import { getHistory, saveHistory, alreadyProcessed } from './session.js';
 import cron from 'node-cron';
 import { nextDayRangeUTC, dayRangeUTCFromYYYYMMDD } from './helpers/datetime.js';
 import { sanitizeWhats } from './helpers/whats-format.js';
-import { isValidCPF, isValidEmail, normalizeWhatsNumber, isValidWhatsNumber } from './helpers/validators.js';
-import { normalizeDateTimeToUTC, normalizeBirthDate } from './helpers/ai-normalize.js';
 import { vertexAI } from './libs/vertex.js';
 import { createWhatsAppRouter, sendWhatsAppTemplate } from './whatsapp.js';
 import {
@@ -166,6 +162,21 @@ POLÍTICA DE CHAMADA DE FERRAMENTAS (REGRAS DURAS)
 
 REGRAS DE APRESENTAÇÃO
 NUNCA exiba “slot #ID” para o paciente.
+
+LISTAS SELECIONÁVEIS
+- Para horários, médicos e especialidades, liste numerando "1- ", "2- ", "3- " (sem asteriscos), mantendo EXATAMENTE a ordem do payload (sem reordenar/agrupar/filtrar/inserir linhas).
+- A opção N corresponde ao item N do payload (1-based). Não exibir IDs internos.
+- Ao final da lista, diga: “Para escolher, responda apenas com o número da opção (ex.: 2).”
+
+INTERPRETAÇÃO
+- Números são interpretados pelo SISTEMA. Sem mensagem interna de seleção, qualquer número (CPF/telefone/data/hora) NÃO é seleção; siga o fluxo normal (validarDataHora, coletar dados etc.).
+- Não tratar “primeira/segunda/terceira…” como seleção.
+
+META (SELEÇÃO INTERNA)
+- "SELECAO_NUMERICA": use (slotId, medicoId, dataISO) como horário escolhido. Ao chamar "criarAgendamento", use "slotId".
+- "SELECAO_MEDICO": use (medicoId, medicoNome) como médico escolhido; prossiga perguntando “dia específico” vs “primeira disponibilidade”.
+- "SELECAO_ESPECIALIDADE": use (especialidadeNome) como especialidade escolhida; prossiga conforme as regras de horários (dia específico vs primeira disponibilidade).
+
 
 Em listagens por especialidade, SEMPRE mostrar "medicoNome".
 • Ex.: “Dr(a). {medicoNome} — qua, 04/09 às 19:05 (30 min)”.
@@ -392,6 +403,110 @@ const model = vertexAI.getGenerativeModel({
 
 
 
+
+function parseOrdinalFromText(s) {
+    const t = String(s || '')
+        .toLowerCase()
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .trim();
+
+    // STRICT: a mensagem inteira precisa representar uma seleção numérica (1–99)
+    // Aceita: "2", "opcao 2", "opcao2", "nº 3", "n.4", "no 5", "#8", "10º."
+    const STRICT = /^\s*(?:(?:op(?:cao|coes)\s*:?\s*)|(?:n(?:\.(?:o|\u00BA|\u00B0)|(?:o|\u00BA|\u00B0)\.?|\.)\s*)|(?:#\s*))?(\d{1,2})(?:\s*(?:a|o|\u00AA|\u00BA|\u00B0))?\s*[.!?]?\s*$/iu;
+    const m = t.match(STRICT);
+    if (!m) return null;
+
+    const n = parseInt(m[1], 10);
+    if (Number.isNaN(n) || n < 1 || n > 99) return null;
+
+    return n;
+}
+
+
+
+// ===== Slots =====
+function flattenSlotsFromResponse(resp) {
+    if (!resp) return [];
+    if (Array.isArray(resp.slots)) return resp.slots;
+
+    // agenda semanal: { agenda: [ { dia, slots: [...] }, ... ] }
+    if (Array.isArray(resp.agenda)) {
+        const acc = [];
+        for (const day of resp.agenda) {
+            for (const s of (day.slots || [])) acc.push(s);
+        }
+        return acc;
+    }
+    return [];
+}
+
+
+
+// ===== Médicos =====
+function flattenMedicosFromResponse(resp) {
+    if (!resp) return [];
+    if (Array.isArray(resp.medicos)) {
+        return resp.medicos.map(m => ({
+            id: String(m.id),
+            nome: m.nome,
+            especialidadeId: m.especialidadeId ?? null,
+        }));
+    }
+    return [];
+}
+
+
+// ===== Especialidades =====
+function flattenEspecialidadesFromResponse(resp) {
+    const arr = Array.isArray(resp?.especialidades) ? resp.especialidades : [];
+    return arr.map(x => String(x).trim()).filter(Boolean);
+}
+
+
+
+// ===== Orquestrador: slots > médicos > especialidades =====
+const SLOT_FUNCS = new Set([
+  'listarHorariosMedico',
+  'listarHorariosPorEspecialidade',
+  'listarProximoDiaDisponivelMedico',
+  'listarProximoDiaDisponivelEspecialidade',
+  'listarAgendaSemanalMedico',
+  'listarAgendaSemanalEspecialidade'
+]);
+const MED_FUNCS = new Set([
+  'listarMedicos',
+  'listarMedicosPorEspecialidade'
+]);
+const ESP_FUNCS = new Set([
+  'listarEspecialidades'
+]);
+
+function getLastListContext(history) {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const parts = history[i]?.parts || [];
+    for (const p of parts) {
+      const fr = p.functionResponse;
+      if (!fr) continue;
+
+      if (SLOT_FUNCS.has(fr.name)) {
+        const items = flattenSlotsFromResponse(fr.response);
+        if (items.length) return { kind: 'slots', items };
+      }
+      if (MED_FUNCS.has(fr.name)) {
+        const items = flattenMedicosFromResponse(fr.response);
+        if (items.length) return { kind: 'medicos', items };
+      }
+      if (ESP_FUNCS.has(fr.name)) {
+        const items = flattenEspecialidadesFromResponse(fr.response);
+        if (items.length) return { kind: 'especialidades', items };
+      }
+    }
+  }
+  return { kind: null, items: [] };
+}
+
+
+
 // ===========================================================
 //  🔁 Core de chat reaproveitável (REST e WhatsApp)
 // ===========================================================
@@ -399,11 +514,65 @@ async function runChatTurn(history, message) {
     console.log('[CHAT] user:', message, '| historyLen:', history.length);
 
     const clockHeader = makeClockHeader();
+
+    // 🔎 tenta interpretar "2", "opção 2", "segunda", etc.
+    const chosen = parseOrdinalFromText(message);
+    let extraMeta = null;
+
+    if (chosen != null) {
+        const { kind, items } = getLastListContext(history);
+
+        if (kind === 'slots' && chosen >= 1 && chosen <= items.length) {
+            const s = items[chosen - 1];
+            extraMeta = {
+                role: 'user',
+                parts: [{
+                    text:
+                        `SELECAO_NUMERICA
+- escolhido: ${chosen}
+- slotId: ${s.id}
+- medicoId: ${s.medicoId ?? ''}
+- dataISO: ${s.isoUTC}
+(INSTRUÇÃO: trate como se o paciente tivesse selecionado este horário. Ao chamar "criarAgendamento", use slotId. Não exiba slotId ao paciente.)`
+                }]
+            };
+        } else if (kind === 'medicos' && chosen >= 1 && chosen <= items.length) {
+            const m = items[chosen - 1];
+            extraMeta = {
+                role: 'user',
+                parts: [{
+                    text:
+                        `SELECAO_MEDICO
+- escolhido: ${chosen}
+- medicoId: ${m.id}
+- medicoNome: ${m.nome}
+(INSTRUÇÃO: trate como se o paciente tivesse escolhido este médico. Prossiga conforme as regras de horários: pergunte "dia específico" vs "primeira disponibilidade" e use as tools adequadas.)`
+                }]
+            };
+        } else if (kind === 'especialidades' && chosen >= 1 && chosen <= items.length) {
+            const espNome = items[chosen - 1];
+            extraMeta = {
+                role: 'user',
+                parts: [{
+                    text:
+                        `SELECAO_ESPECIALIDADE
+- escolhido: ${chosen}
+- especialidadeNome: ${espNome}
+(INSTRUÇÃO: trate como se o paciente tivesse escolhido esta especialidade. Prossiga conforme as regras: listar médicos/horários da especialidade.)`
+                }]
+            };
+        }
+    }
+
+
     let contents = [
         ...history,
-        { role: 'user', parts: [{ text: clockHeader }] }, // ⬅️ cabeçalho com relógio atual
+        { role: 'user', parts: [{ text: clockHeader }] },
+        ...(extraMeta ? [extraMeta] : []),
         { role: 'user', parts: [{ text: message }] }
     ];
+
+
 
     const ctxDelta = [];
 

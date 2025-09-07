@@ -36,3 +36,6 @@ export async function getLastSlotsAny(phone) {
   if (!raw) return [];
   try { return JSON.parse(raw); } catch { return []; }
 }
+
+
+

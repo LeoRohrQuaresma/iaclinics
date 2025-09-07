@@ -500,7 +500,6 @@ export async function listarMedicosPorEspecialidadeDB(args = {}) {
 /* -------------------------------------------------------------------------- */
 /* listarHorariosMedicoDB                                                     */
 /* -------------------------------------------------------------------------- */
-// listarHorariosMedicoDB
 export async function listarHorariosMedicoDB(args = {}) {
   try {
     const tz = CLINIC_TZ;

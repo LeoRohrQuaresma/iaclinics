@@ -136,7 +136,7 @@ export function createWhatsAppRouter({ runChatTurn, getHistory, saveHistory, alr
         }
 
         const history = await getHistory(userId);
-        const { text: reply, ctxDelta } = await runChatTurn(history, text);
+        const { text: reply, ctxDelta } = await runChatTurn(history, text)
 
         const newHistory = [
             ...history,
